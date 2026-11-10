@@ -2,6 +2,11 @@
 
 ## 0.13.0 - TBD
 
+* Fix the managed SPNEGO (`NegotiateProxy`) state machine so `negState: accept-complete` no longer establishes the context on its own when a `mechListMIC` exchange is in flight
+  * Once the peer has sent `request-mic`, this side has sent a MIC, or DCE style authentication is in use, an `accept-complete` that carries no verifiable `mechListMIC` (including one blanked by the legacy `responseToken == mechListMIC` compatibility handling) now raises `InvalidTokenError` instead of completing
+  * A `mechListMIC` that fails verification against the confirmed mechanism list leaves the context permanently unusable; `wrap`/`unwrap` and the IOV/WinRM variants now raise `NoContextError` until the whole negotiation, including MIC verification, has completed
+  * An initiator that has entered the MIC exchange waits for the acceptor's explicit `accept-complete` rather than marking itself complete after the first MIC leg; non-downgraded negotiations still complete in the same number of steps
+
 ## 0.12.4 - 2026-10-06
 
 * Fix SSPI acceptor with explicit `Password` or `KerberosKeytab` credentials failing with `SEC_E_LOGON_DENIED` when the username is in the UPN form `user@REALM`

@@ -84,6 +84,15 @@ class NegotiateProxy(ContextProxy):
         self._mech_sent = False
         self._mic_sent = False
         self._mic_recv = False
+        # Tracks whether the peer has sent negState accept-complete. The flag on its own must never mark the
+        # negotiation as complete, completion is only granted after the mechListMIC requirements are met.
+        self._accept_complete_recv = False
+        # Whether the peer explicitly asked for a mechListMIC through the request-mic negState. Once requested the
+        # MIC exchange is mandatory and a later accept-complete without a verifiable MIC is a downgrade attempt.
+        self._mic_requested = False
+        # Set when a received mechListMIC fails verification. The negotiation can never recover from this and the
+        # context must refuse all per-message protection.
+        self._mic_failed = False
         # DCE will always send a MIC token, even for Kerberos.
         self._mic_required = bool(self.context_req & ContextReq.dce_style)
 
@@ -164,6 +173,19 @@ class NegotiateProxy(ContextProxy):
         if is_spnego:
             # Step 3. Process / generate the mechListMIC.
             out_mic = self._step_spnego_mic(in_mic=mech_list_mic)
+
+            # The peer claimed accept-complete while a mechListMIC exchange is in flight but no MIC was received (or
+            # it was blanked by the legacy compatibility check below). Treating accept-complete as sufficient here
+            # would let an attacker strip or forge the MIC and downgrade the offered mechanism list. When no MIC
+            # exchange was ever started the peer is legitimately completing without MIC protection, which is still
+            # allowed for backward compatibility.
+            mic_exchange_active = self._mic_requested or self._mic_sent or bool(
+                self.context_req & ContextReq.dce_style
+            )
+            if self._accept_complete_recv and mic_exchange_active and not self._mic_recv:
+                raise InvalidTokenError(
+                    context_msg="Received SPNEGO accept-complete without the required mechListMIC"
+                )
 
             # Step 4. Generate the output SPNEGO token.
             out_token = self._step_spnego_output(out_token=mech_token_out, out_mic=out_mic)
@@ -256,8 +278,12 @@ class NegotiateProxy(ContextProxy):
 
                 if in_token.neg_state == NegState.request_mic:
                     self._mic_required = True
+                    self._mic_requested = True
                 elif in_token.neg_state == NegState.accept_complete:
-                    self._complete = True
+                    # RFC 4178 3.2: accept-complete does not establish the context on its own. If a mechListMIC is
+                    # required it must still be received and verified before the negotiation is considered complete.
+                    # The final decision happens in step() once the MIC has been processed.
+                    self._accept_complete_recv = True
 
             else:
                 # This usually indicates the token is a raw NTLM or Kerberos token, return as is.
@@ -300,25 +326,39 @@ class NegotiateProxy(ContextProxy):
                 out_token = context.step(in_token=in_token, channel_bindings=channel_bindings)
 
             # NTLM has a special case where we need to tell it it's ok to generate the MIC and also determine if
-            # it actually did set the MIC as that controls the mechListMIC for the SPNEGO token.
-            if self._requires_mech_list_mic:
+            # it actually did set the MIC as that controls the mechListMIC for the SPNEGO token. The property must be
+            # invoked while the NTLM context is still incomplete to arm MIC generation; only NTLM reports a genuine
+            # requirement once complete, Kerberos (and test doubles) always report False through the base class.
+            requires_mic = self._requires_mech_list_mic
+            if chosen_mech == GSSMech.ntlm and context.complete and requires_mic:
                 self._mic_required = True
 
         return out_token
 
     def _step_spnego_mic(self, in_mic: typing.Optional[bytes] = None) -> typing.Optional[bytes]:
         if in_mic:
-            self.verify(pack_mech_type_list(self._mech_list), in_mic)
+            # Go straight to the inner context: the outer negotiation is not complete yet and the public verify()
+            # enforces that as a guard against using the context after a failed negotiation.
+            try:
+                self._context.verify(pack_mech_type_list(self._mech_list), in_mic)
+            except Exception:
+                # A mechListMIC that does not match the mechanism list this side confirmed is a tampering or
+                # downgrade attempt. Record the failure so the context stays unusable even though the inner mech may
+                # already hold session keys, then surface the original verification error.
+                self._mic_failed = True
+                raise
             self._reset_ntlm_crypto_state(outgoing=False)
 
             self._mic_required = True  # If we received a mechListMIC we need to send one back.
             self._mic_recv = True
 
-            if self._mic_sent:
+            if self._mic_sent and self.usage == "accept":
+                # The acceptor is the endpoint of the MIC exchange: the initiator's verified MIC is the last message
+                # it expects. An initiator still has to wait for the acceptor's explicit accept-complete negState.
                 self._complete = True
 
         if self._context.complete and self._mic_required and not self._mic_sent:
-            out_mic = self.sign(pack_mech_type_list(self._mech_list))
+            out_mic = self._context.sign(pack_mech_type_list(self._mech_list))
             self._reset_ntlm_crypto_state()
 
             self._mic_sent = True
@@ -360,9 +400,26 @@ class NegotiateProxy(ContextProxy):
 
                 self._mech_sent = True
 
-            if self._context.complete and (not self._mic_required or (self._mic_sent and self._mic_recv)):
+            # A MIC only needs to have been exchanged when this side actually sent one. The side that receives the
+            # final MIC is the exchange endpoint and completes without sending anything back, while a peer that never
+            # requested a MIC at all is covered by the not-required branch for backward compatibility.
+            mic_satisfied = not self._mic_required or (not self._mic_sent or self._mic_recv)
+
+            # Once an initiator has entered the MIC exchange it must wait for the acceptor's explicit accept-complete
+            # negState rather than declaring completion on its own (RFC 4178 section 3.2).
+            waiting_accept_complete = (
+                self.usage == "initiate" and (self._mic_requested or self._mic_sent)
+                and not self._accept_complete_recv
+            )
+            if self._context.complete and mic_satisfied and not waiting_accept_complete:
                 state = NegState.accept_complete
                 self._complete = True
+
+            # The initiator has no mechanism token or MIC left to send once the inner context is complete, so an
+            # accept-complete reply would be an empty token the peer is not expecting. Only the acceptor emits the
+            # token that carries supportedMech in the first reply; the initiator terminates the exchange.
+            if self._complete and not out_token and not out_mic and self.usage == "initiate":
+                return None
 
             final_token = NegTokenResp(
                 neg_state=state, supported_mech=supported_mech, response_token=out_token, mech_list_mic=out_mic
@@ -377,6 +434,7 @@ class NegotiateProxy(ContextProxy):
         return self._context.query_message_sizes()
 
     def wrap(self, data: bytes, encrypt: bool = True, qop: typing.Optional[int] = None) -> WrapResult:
+        self._require_complete()
         return self._context.wrap(data, encrypt=encrypt, qop=qop)
 
     def wrap_iov(
@@ -385,21 +443,26 @@ class NegotiateProxy(ContextProxy):
         encrypt: bool = True,
         qop: typing.Optional[int] = None,
     ) -> IOVWrapResult:
+        self._require_complete()
         return self._context.wrap_iov(iov, encrypt=encrypt, qop=qop)
 
     def wrap_winrm(self, data: bytes) -> WinRMWrapResult:
+        self._require_complete()
         return self._context.wrap_winrm(data)
 
     def unwrap(self, data: bytes) -> UnwrapResult:
+        self._require_complete()
         return self._context.unwrap(data)
 
     def unwrap_iov(
         self,
         iov: typing.Iterable[IOV],
     ) -> IOVUnwrapResult:
+        self._require_complete()
         return self._context.unwrap_iov(iov)
 
     def unwrap_winrm(self, header: bytes, data: bytes) -> bytes:
+        self._require_complete()
         return self._context.unwrap_winrm(header, data)
 
     def sign(self, data: bytes, qop: typing.Optional[int] = None) -> bytes:
@@ -407,6 +470,26 @@ class NegotiateProxy(ContextProxy):
 
     def verify(self, data: bytes, mic: bytes) -> int:
         return self._context.verify(data, mic)
+
+    def _require_complete(self) -> None:
+        # A failed mechListMIC verification is terminal: the confirmed mechanism lists disagree and the context must
+        # never expose per-message protection regardless of the inner mechanism state.
+        if self._mic_failed:
+            raise NoContextError(
+                context_msg="Cannot use the context, the SPNEGO mechListMIC verification failed"
+            )
+
+        # The inner mechanism may have established its own session keys (and report complete) while the outer SPNEGO
+        # negotiation is still exchanging a mechListMIC. In that in-progress state per-message protection is still
+        # legitimately used (for example by CredSSP). The guard only blocks usage once the peer has claimed
+        # accept-complete but the MIC requirements have not been satisfied, which indicates a failed negotiation.
+        if self._accept_complete_recv and not self._complete:
+            raise NoContextError(
+                context_msg="Cannot use the context until the SPNEGO mechListMIC has been verified"
+            )
+
+        if not self._context.complete:
+            raise NoContextError(context_msg="Cannot use the context until the SPNEGO negotiation has completed")
 
     @property
     def _context(self) -> ContextProxy:
