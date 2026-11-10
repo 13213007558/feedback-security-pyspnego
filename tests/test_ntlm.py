@@ -7,6 +7,7 @@ import os
 import pathlib
 import re
 import socket
+import struct
 
 import pytest
 
@@ -15,7 +16,7 @@ import spnego._ntlm as ntlm
 import spnego.channel_bindings
 import spnego.iov
 from spnego._credential import CredentialCache
-from spnego._ntlm_raw.crypto import md4
+from spnego._ntlm_raw.crypto import hmac_md5, md4, rc4, rc4init, sealkey, signkey
 from spnego._ntlm_raw.messages import (
     Authenticate,
     AvId,
@@ -1004,3 +1005,347 @@ def test_ntlm_iov_unwrapping_as_stream(ntlm_cred):
     assert res4.qop == 0
     assert len(res4.buffers) == 2
     assert res4.buffers[1].data == b"data"
+
+
+FIXED_NTLM_SESSION_KEY = bytes(bytearray(range(1, 17)))
+
+
+@pytest.fixture()
+def ntlm_iov_pair(ntlm_cred, monkeypatch):
+    """An established NTLM client/server pair with fixed session material.
+
+    All the randomness in the pure Python NTLM handshake (the client session
+    key, server challenge, and client challenge) comes from os.urandom.
+    Pinning it makes the derived keys deterministic so the expected wrap
+    output can be computed independently of the public API.
+    """
+    monkeypatch.setattr(ntlm.os, "urandom", lambda n: bytes(bytearray((i + 1) & 0xFF for i in range(n))))
+
+    c = spnego.client(
+        ntlm_cred[0],
+        ntlm_cred[1],
+        hostname=socket.gethostname(),
+        protocol="ntlm",
+        options=spnego.NegotiateOptions.use_ntlm,
+    )
+    s = spnego.server(protocol="ntlm")
+    s.step(c.step(s.step(c.step())))
+
+    # Sanity check the session material really is the fixed value and that
+    # ESS was negotiated which the independent MAC computation relies on.
+    assert c.session_key == s.session_key == FIXED_NTLM_SESSION_KEY
+    assert c._context_attr == s._context_attr
+    assert c._context_attr & NegotiateFlags.extended_session_security
+
+    return c, s
+
+
+def _ntlm_iov_expected(flags, session_key, usage, seq_num, to_seal, to_sign):
+    """Independently derives the NTLM ciphertext and signature for wrap_iov.
+
+    Builds the signature input and MAC by following MS-NLMP with the raw
+    session material rather than calling into the context wrap path. This
+    ensures a bug shared by wrap_iov and unwrap_iov cannot make the tests
+    pass self-consistently.
+    """
+    handle = rc4init(sealkey(flags, session_key, usage))
+    sign_key = signkey(flags, session_key, usage)
+
+    ciphertext = rc4(handle, to_seal)
+
+    # NTLMSSP_MESSAGE_SIGNATURE with Extended Session Security, the checksum
+    # covers the sequence number concatenated with the message to sign.
+    checksum = hmac_md5(sign_key, struct.pack("<I", seq_num) + to_sign)[:8]
+    if flags & NegotiateFlags.key_exch:
+        checksum = rc4(handle, checksum)
+
+    signature = b"\x01\x00\x00\x00" + checksum + struct.pack("<I", seq_num)
+    return ciphertext, signature
+
+
+def _iov_buffer_type(entry):
+    if isinstance(entry, tuple):
+        return spnego.iov.BufferType(entry[0])
+    if isinstance(entry, bytes):
+        return spnego.iov.BufferType.data
+    return spnego.iov.BufferType(entry)
+
+
+@pytest.mark.parametrize("direction", ["initiate", "accept"])
+@pytest.mark.parametrize(
+    "iov, data_idx, plaintext, signed",
+    [
+        (
+            [spnego.iov.BufferType.header, b"confidential body"],
+            1,
+            b"confidential body",
+            [(1, b"confidential body")],
+        ),
+        (
+            [(spnego.iov.BufferType.header, b""), b"confidential body"],
+            1,
+            b"confidential body",
+            [(1, b"confidential body")],
+        ),
+        (
+            [
+                (spnego.iov.BufferType.sign_only, b"public header"),
+                b"confidential body",
+                spnego.iov.BufferType.header,
+            ],
+            1,
+            b"confidential body",
+            [(0, b"public header"), (1, b"confidential body")],
+        ),
+        (
+            [
+                b"confidential body",
+                (spnego.iov.BufferType.sign_only, b"public header"),
+                spnego.iov.BufferType.header,
+            ],
+            0,
+            b"confidential body",
+            [(0, b"confidential body"), (1, b"public header")],
+        ),
+        (
+            [
+                (spnego.iov.BufferType.sign_only, b"public header"),
+                spnego.iov.BufferType.header,
+                b"confidential body",
+            ],
+            2,
+            b"confidential body",
+            [(0, b"public header"), (2, b"confidential body")],
+        ),
+        (
+            [
+                (spnego.iov.BufferType.sign_only, b"header 1"),
+                b"confidential body",
+                (spnego.iov.BufferType.data_readonly, b"header 2"),
+                (spnego.iov.BufferType.sign_only, b"header 3"),
+                spnego.iov.BufferType.header,
+            ],
+            1,
+            b"confidential body",
+            [
+                (0, b"header 1"),
+                (1, b"confidential body"),
+                (2, b"header 2"),
+                (3, b"header 3"),
+            ],
+        ),
+        (
+            [
+                (spnego.iov.BufferType.sign_only, b""),
+                b"",
+                (spnego.iov.BufferType.data_readonly, b""),
+                spnego.iov.BufferType.header,
+            ],
+            1,
+            b"",
+            [(0, b""), (1, b""), (2, b"")],
+        ),
+    ],
+    ids=[
+        "auto-header",
+        "provided-header",
+        "public-header-first",
+        "public-header-last",
+        "header-buffer-in-middle",
+        "multiple-signed-segments",
+        "empty-segments",
+    ],
+)
+def test_ntlm_iov_public_header_signed_not_encrypted(ntlm_iov_pair, direction, iov, data_idx, plaintext, signed):
+    c, s = ntlm_iov_pair
+    w, r = (c, s) if direction == "initiate" else (s, c)
+
+    header_idx = next(i for i, e in enumerate(iov) if _iov_buffer_type(e) == spnego.iov.BufferType.header)
+
+    expected_ciphertext, expected_signature = _ntlm_iov_expected(
+        w._context_attr,
+        w.session_key,
+        direction,
+        0,
+        plaintext,
+        b"".join(d for _, d in signed),
+    )
+
+    res = w.wrap_iov(iov)
+    assert isinstance(res, spnego.IOVWrapResult)
+    assert res.encrypted
+    assert len(res.buffers) == len(iov)
+
+    # The signature is placed in the header buffer wherever it sits in the list.
+    assert res.buffers[header_idx].type == spnego.iov.BufferType.header
+    assert res.buffers[header_idx].data == expected_signature
+
+    # The confidential body is encrypted on the wire.
+    assert res.buffers[data_idx].data == expected_ciphertext
+    if plaintext:
+        assert res.buffers[data_idx].data != plaintext
+
+    # The public header and other signed buffers are captured in the output
+    # unencrypted.
+    for idx, expected in signed:
+        if idx != data_idx:
+            assert res.buffers[idx].data == expected
+
+    unwrap_res = r.unwrap_iov(res.buffers)
+    assert isinstance(unwrap_res, spnego.IOVUnwrapResult)
+    assert unwrap_res.encrypted
+    assert unwrap_res.buffers[header_idx].data == expected_signature
+    assert unwrap_res.buffers[data_idx].data == plaintext
+    for idx, expected in signed:
+        if idx != data_idx:
+            assert unwrap_res.buffers[idx].data == expected
+
+
+def test_ntlm_iov_public_header_tamper_fails_verification(ntlm_iov_pair):
+    c, s = ntlm_iov_pair
+    public_header = b"public header!"
+    body = b"confidential body"
+
+    def iov_entries(header, ciphertext, signature):
+        return [
+            (spnego.iov.BufferType.sign_only, header),
+            (spnego.iov.BufferType.data, ciphertext),
+            (spnego.iov.BufferType.header, signature),
+        ]
+
+    # Flip every byte of the public header in turn, verification must fail
+    # each time even though the header itself is not encrypted.
+    for idx in range(len(public_header)):
+        res = c.wrap_iov(iov_entries(public_header, body, None))
+
+        tampered = bytearray(res.buffers[0].data or b"")
+        tampered[idx] ^= 0xFF
+
+        with pytest.raises(BadMICError, match="Invalid Message integrity Check"):
+            s.unwrap_iov(iov_entries(bytes(tampered), res.buffers[1].data, res.buffers[2].data))
+
+    # A tampered confidential body must also fail verification.
+    res = c.wrap_iov(iov_entries(public_header, body, None))
+    tampered_body = bytearray(res.buffers[1].data or b"")
+    tampered_body[0] ^= 0xFF
+    with pytest.raises(BadMICError, match="Invalid Message integrity Check"):
+        s.unwrap_iov(iov_entries(res.buffers[0].data, bytes(tampered_body), res.buffers[2].data))
+
+    # The failed attempts consume sequence numbers in lockstep on both sides
+    # so an untampered message still verifies afterwards.
+    res = c.wrap_iov(iov_entries(public_header, body, None))
+    unwrap_res = s.unwrap_iov(res.buffers)
+    assert unwrap_res.buffers[0].data == public_header
+    assert unwrap_res.buffers[1].data == body
+
+
+@pytest.mark.parametrize(
+    "iov, match",
+    [
+        ([], "wrap_iov no IOV header buffer present"),
+        ([b"data"], "wrap_iov no IOV header buffer present"),
+        ([spnego.iov.BufferType.header], "wrap_iov no IOV data buffer present"),
+        (
+            [spnego.iov.BufferType.header, b"a", b"b"],
+            "wrap_iov must only be used with 1 data IOV buffer",
+        ),
+        (
+            [spnego.iov.BufferType.header, b"a", spnego.iov.BufferType.header],
+            "wrap_iov must only be used with 1 header IOV buffer",
+        ),
+        (
+            [spnego.iov.BufferType.header, b"a", (spnego.iov.BufferType.empty, b"")],
+            "wrap_iov unsupported IOV buffer type empty",
+        ),
+        (
+            [spnego.iov.BufferType.header, b"a", (spnego.iov.BufferType.padding, b"")],
+            "wrap_iov unsupported IOV buffer type padding",
+        ),
+        (
+            [spnego.iov.BufferType.header, b"a", (spnego.iov.BufferType.trailer, b"")],
+            "wrap_iov unsupported IOV buffer type trailer",
+        ),
+        (
+            [spnego.iov.BufferType.header, b"a", (spnego.iov.BufferType.stream, b"")],
+            "wrap_iov unsupported IOV buffer type stream",
+        ),
+        (
+            [spnego.iov.BufferType.header, b"a", (spnego.iov.BufferType.pkg_params, b"")],
+            "wrap_iov unsupported IOV buffer type pkg_params",
+        ),
+        (
+            [spnego.iov.BufferType.header, b"a", (spnego.iov.BufferType.mic_token, b"")],
+            "wrap_iov unsupported IOV buffer type mic_token",
+        ),
+        (
+            [spnego.iov.BufferType.header, (spnego.iov.BufferType.data, 4)],
+            "wrap_iov IOV data buffer at \\[1\\] must be bytes",
+        ),
+        (
+            [spnego.iov.BufferType.header, b"a", (spnego.iov.BufferType.sign_only, 4)],
+            "wrap_iov IOV sign_only buffer at \\[2\\] must be bytes",
+        ),
+    ],
+)
+def test_ntlm_wrap_iov_invalid_layout_commits_no_output(ntlm_iov_pair, iov, match):
+    c, s = ntlm_iov_pair
+
+    with pytest.raises(InvalidTokenError, match=match):
+        c.wrap_iov(iov)
+
+    # The failure must be raised before any observable output is committed:
+    # the next valid message is still sealed with sequence number 0 and
+    # verifies on the peer.
+    res = c.wrap_iov([spnego.iov.BufferType.header, b"data"])
+    assert (res.buffers[0].data or b"")[12:] == b"\x00\x00\x00\x00"
+    assert s.unwrap_iov(res.buffers).buffers[1].data == b"data"
+
+
+@pytest.mark.parametrize(
+    "iov, match",
+    [
+        (
+            [(spnego.iov.BufferType.data, b"data")],
+            "unwrap_iov no IOV header buffer present",
+        ),
+        (
+            [(spnego.iov.BufferType.header, b"\x00" * 16)],
+            "unwrap_iov no IOV data buffer present",
+        ),
+        (
+            [(spnego.iov.BufferType.header, b"\x00" * 16), b"a", b"b"],
+            "unwrap_iov must only be used with 1 data IOV buffer",
+        ),
+        (
+            [
+                (spnego.iov.BufferType.header, b"\x00" * 16),
+                b"a",
+                (spnego.iov.BufferType.header, b"\x00" * 16),
+            ],
+            "unwrap_iov must only be used with 1 header IOV buffer",
+        ),
+        (
+            [(spnego.iov.BufferType.header, b"\x00" * 16), b"a", (spnego.iov.BufferType.empty, b"")],
+            "unwrap_iov unsupported IOV buffer type empty",
+        ),
+        (
+            [(spnego.iov.BufferType.header, b"\x00" * 16), b"a", (spnego.iov.BufferType.padding, b"")],
+            "unwrap_iov unsupported IOV buffer type padding",
+        ),
+        (
+            [(spnego.iov.BufferType.header, b"\x00" * 16), (spnego.iov.BufferType.data, 4)],
+            "unwrap_iov IOV data buffer at \\[1\\] must be bytes",
+        ),
+    ],
+)
+def test_ntlm_unwrap_iov_invalid_layout_commits_no_output(ntlm_iov_pair, iov, match):
+    c, s = ntlm_iov_pair
+    valid = c.wrap_iov([spnego.iov.BufferType.header, b"data"])
+
+    with pytest.raises(InvalidTokenError, match=match):
+        s.unwrap_iov(iov)
+
+    # The structural failure is raised before any decryption or verification
+    # state is consumed so the valid message still unwraps afterwards.
+    res = s.unwrap_iov(valid.buffers)
+    assert res.buffers[1].data == b"data"
