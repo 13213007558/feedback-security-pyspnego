@@ -867,6 +867,98 @@ def test_ntlm_verify_fail(client_opt, ntlm_cred):
         s.verify(b"data", sig)
 
 
+def _ntlm_message_context(ntlm_cred, monkeypatch, lm_compat_level=None):
+    """Builds a completed pair of local pure-Python NTLM contexts for message tests."""
+    if lm_compat_level is not None:
+        monkeypatch.setenv("LM_COMPAT_LEVEL", str(lm_compat_level))
+
+    client = spnego.client(
+        ntlm_cred[0],
+        ntlm_cred[1],
+        hostname=socket.gethostname(),
+        options=spnego.NegotiateOptions.use_ntlm,
+        protocol="ntlm",
+    )
+    server = spnego.server(options=spnego.NegotiateOptions.use_ntlm, protocol="ntlm")
+
+    server.step(client.step(server.step(client.step())))
+    assert client.complete and server.complete
+
+    return client, server
+
+
+@pytest.mark.parametrize("lm_compat_level", [None, 0, 2])
+def test_ntlm_bad_mic_retires_inbound_unwrap(ntlm_cred, monkeypatch, lm_compat_level):
+    # A length-mismatched corrupted message consumes a different number of RC4 bytes on the receiver than the sender
+    # produced, so the inbound stream can never be realigned. The bad message is rejected and the receive side is
+    # retired; later valid messages get a stable error rather than silently failing against a poisoned stream.
+    client, server = _ntlm_message_context(ntlm_cred, monkeypatch, lm_compat_level)
+    ess = bool(server._context_attr & NegotiateFlags.extended_session_security)
+
+    assert server.unwrap(client.wrap(b"first message").data).data == b"first message"
+
+    wrapped = client.wrap(b"second message that is longer")
+    truncated = wrapped.data[:20]  # Fewer bytes than were sealed, desyncing the inbound RC4 handle.
+
+    with pytest.raises(BadMICError, match="Invalid Message integrity Check"):
+        server.unwrap(truncated)
+
+    # With ESS the two directions keep independent RC4 handles/sequence numbers, so the outbound direction survives.
+    # Without ESS NTLM uses a single shared handle and sequence counter for both directions, so the peer cannot unwrap
+    # further outbound messages either; either way the context must be re-established (asserted below).
+    if ess:
+        server_out = server.wrap(b"outbound still works")
+        assert client.unwrap(server_out.data).data == b"outbound still works"
+
+    # Every inbound entry point now reports the same stable failure.
+    winrm = client.wrap_winrm(b"winrm")
+    with pytest.raises(BadMICError, match="cannot be resynchronised"):
+        server.unwrap(client.wrap(b"later valid message").data)
+    with pytest.raises(BadMICError, match="cannot be resynchronised"):
+        server.unwrap_winrm(winrm.header, winrm.data)
+    with pytest.raises(BadMICError, match="cannot be resynchronised"):
+        server.verify(b"later valid message", client.sign(b"later valid message"))
+    with pytest.raises(BadMICError, match="cannot be resynchronised"):
+        server.unwrap_iov(
+            [
+                (spnego.iov.BufferType.header, b"\x00" * 16),
+                (spnego.iov.BufferType.data, b"\x00" * 8),
+            ]
+        )
+
+    # Recovery is explicit: a freshly negotiated context exchanges messages again.
+    client2, server2 = _ntlm_message_context(ntlm_cred, monkeypatch, lm_compat_level)
+    assert server2.unwrap(client2.wrap(b"brand new context").data).data == b"brand new context"
+
+
+@pytest.mark.parametrize("lm_compat_level", [0, 2])
+def test_ntlm_bad_mic_retires_inbound_verify(ntlm_cred, monkeypatch, lm_compat_level):
+    # Covers both the non-ESS (LM compat 0, shared RC4 handle and CRC32 MAC) and ESS (LM compat 2) paths through the
+    # standalone sign/verify contract. A failed verify retires the inbound side even though the bad token itself never
+    # carried a payload.
+    client, server = _ntlm_message_context(ntlm_cred, monkeypatch, lm_compat_level)
+    ess = bool(server._context_attr & NegotiateFlags.extended_session_security)
+
+    data = b"sign this message"
+    good_mic = client.sign(data)
+    server.verify(data, good_mic)
+
+    # A MIC produced for a different payload cannot match, regardless of the MAC algorithm (CRC32 or HMAC-MD5).
+    foreign_mic = client.sign(b"a completely different message")
+    with pytest.raises(BadMICError, match="Invalid Message integrity Check"):
+        server.verify(data, foreign_mic)
+
+    # The next, genuinely valid MIC is refused with the stable error instead of being checked against poisoned state.
+    with pytest.raises(BadMICError, match="cannot be resynchronised"):
+        server.verify(b"another message", client.sign(b"another message"))
+
+    # Outbound sealing on the same context keeps working only with ESS; without ESS both directions share one RC4
+    # handle and sequence counter, so they are retired together.
+    if ess:
+        sealed = server.wrap(b"still sealing outbound")
+        assert client.unwrap(sealed.data).data == b"still sealing outbound"
+
+
 def test_ntlm_anon_response(ntlm_cred):
     c = spnego.client(ntlm_cred[0], ntlm_cred[1], options=spnego.NegotiateOptions.use_ntlm, protocol="ntlm")
     s = spnego.server(options=spnego.NegotiateOptions.use_ntlm, protocol="ntlm")

@@ -2,6 +2,11 @@
 
 ## 0.13.0 - TBD
 
+* Retire the receive side of a pure-Python NTLM context after a failed MIC check
+  * A failed :meth:`NTLMProxy.verify` (including the checks run by `unwrap`, `unwrap_iov`, and `unwrap_winrm`) had already advanced the inbound RC4 keystream and sequence state by an amount that depends on the untrusted message length, so the stream could not be safely realigned and later, valid messages would fail against a poisoned context
+  * The context now records the failure and every subsequent receive-side call raises a stable `BadMICError` explaining the context must be re-established, instead of failing later with a misleading MIC mismatch; the outbound side is left untouched when extended session security (ESS) is negotiated
+  * Callers should treat a `BadMICError` from a message operation as fatal for that connection and re-authenticate to build a new security context; without ESS, NTLM shares a single RC4 handle and sequence counter across both directions so no in-place recovery is possible
+
 ## 0.12.4 - 2026-10-06
 
 * Fix SSPI acceptor with explicit `Password` or `KerberosKeytab` credentials failing with `SEC_E_LOGON_DENIED` when the username is in the UPN form `user@REALM`

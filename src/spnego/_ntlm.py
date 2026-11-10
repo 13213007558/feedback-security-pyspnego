@@ -324,6 +324,11 @@ class NTLMProxy(ContextProxy):
         self.__seq_num_in = 0
         self.__seq_num_out = 0
 
+        # Set to True once an inbound message fails its MIC check. A failed verification has already advanced the
+        # inbound RC4 stream (and sequence state) by an unknown amount, so the receive side can never be realigned with
+        # the peer. See _check_inbound_usable() for the full rationale.
+        self.__inbound_failed = False
+
     @classmethod
     def available_protocols(cls, options: typing.Optional[NegotiateOptions] = None) -> typing.List[str]:
         return ["ntlm"]
@@ -747,6 +752,8 @@ class NTLMProxy(ContextProxy):
         if not self._handle_in:
             raise NoContextError(context_msg="Cannot unwrap until context has been established")
 
+        self._check_inbound_usable()
+
         signature = data[:16]
         msg = self._handle_in.update(data[16:])
         self.verify(msg, signature)
@@ -762,6 +769,8 @@ class NTLMProxy(ContextProxy):
 
         if not self._handle_in or self._sign_key_in is None:
             raise NoContextError(context_msg="Cannot unwrap until context has been established")
+
+        self._check_inbound_usable()
 
         buffers = self._build_iov_list(iov, lambda b: b)
 
@@ -840,6 +849,8 @@ class NTLMProxy(ContextProxy):
         if not self._handle_in:
             raise NoContextError(context_msg="Cannot unwrap until context has been established")
 
+        self._check_inbound_usable()
+
         msg = self._handle_in.update(data)
         self.verify(msg, header)
 
@@ -864,6 +875,8 @@ class NTLMProxy(ContextProxy):
         if not self._handle_in or self._sign_key_in is None:
             raise NoContextError(context_msg="Cannot verify until context has been established")
 
+        self._check_inbound_usable()
+
         expected_sig = sign(
             self._context_attr,
             self._handle_in,
@@ -873,9 +886,33 @@ class NTLMProxy(ContextProxy):
         )
 
         if expected_sig != mic:
+            self._fail_inbound()
             raise BadMICError(context_msg="Invalid Message integrity Check (MIC) detected")
 
         return 0
+
+    def _check_inbound_usable(self) -> None:
+        """Guards the receive-side message functions (verify/unwrap*).
+
+        NTLM message protection is built on a single RC4 keystream per direction and on monotonically advancing
+        sequence numbers. Computing the expected MIC in :meth:`verify` consumes RC4 bytes and :meth:`unwrap` decrypts the
+        payload before the MIC is checked, so a message that fails verification has already moved the inbound state
+        forward by an amount that depends on the (untrusted) message length. RC4 cannot be seeked backwards and there is
+        no length the caller can trust to re-synchronise the stream, so rolling the sequence number back is not a safe
+        recovery. The receive side is therefore permanently retired on the first bad MIC, matching the behaviour of
+        SSPI's ``DecryptMessage``/``VerifySignature`` which report ``SEC_E_MESSAGE_ALTERED`` for a poisoned context.
+
+        The outbound side is deliberately left untouched so the peer can still be told the connection must be rebuilt.
+        Establish a brand new security context (re-authenticate) before exchanging any further protected messages.
+        """
+        if self.__inbound_failed:
+            raise BadMICError(
+                context_msg="Cannot verify or unwrap further messages after a MIC verification failure; the inbound "
+                "NTLM crypto state cannot be resynchronised so the context must be re-established"
+            )
+
+    def _fail_inbound(self) -> None:
+        self.__inbound_failed = True
 
     @property
     def _context_attr_map(self) -> typing.List[typing.Tuple[ContextReq, int]]:

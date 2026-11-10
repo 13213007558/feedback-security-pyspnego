@@ -587,6 +587,12 @@ class ContextProxy(metaclass=abc.ABCMeta):
         Returns:
             UnwrapResult: The unwrapped message, whether it was encrypted, and the QoP used.
 
+        Raises:
+            BadMICError: If the message fails its integrity check. On the pure-Python NTLM provider this also retires
+                the receive side of the context because the inbound RC4 keystream and sequence state cannot be
+                resynchronised; every later ``unwrap``/``verify`` on the same context raises the same error until the
+                security context is re-established. Re-authenticate to create a new context rather than retrying.
+
         .. _gss_unwrap:
             https://tools.ietf.org/html/rfc2744.html#section-5.31
 
@@ -677,6 +683,12 @@ class ContextProxy(metaclass=abc.ABCMeta):
 
         Returns:
             int: The QoP (Quality of Protection) used.
+
+        Raises:
+            BadMICError: If the MIC does not match the data. On the pure-Python NTLM provider a failed verification
+                retires the receive side of the context: the inbound RC4 keystream and sequence state cannot be rolled
+                back, so every later ``verify``/``unwrap`` on the same context keeps raising until the security context
+                is re-established. Re-authenticate to create a new context rather than retrying on the same context.
 
         .. _gss_verify_mic:
             https://tools.ietf.org/html/rfc2744.html#section-5.32
