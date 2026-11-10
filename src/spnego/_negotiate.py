@@ -50,6 +50,10 @@ class NegotiateProxy(ContextProxy):
     generate SPNEGO tokens.
     """
 
+    # The strict option is propagated to the inner context. An inner NTLMProxy enforces it directly while an inner
+    # provider that cannot enforce it fails when the inner context is built, so an acceptor never completes silently.
+    _supports_strict_channel_bindings = True
+
     def __init__(
         self,
         username: typing.Optional[typing.Union[str, Credential, typing.List[Credential]]] = None,

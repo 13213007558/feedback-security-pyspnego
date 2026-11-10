@@ -191,10 +191,15 @@ def server(
     Args:
         hostname: The principal part of the SPN. This is required for Kerberos auth to build the SPN.
         service: The service part of the SPN. This is required for Kerberos auth to build the SPN.
-        channel_bindings: The optional :class:`spnego.channel_bindings.GssChannelBindings` for the context.
+        channel_bindings: The optional :class:`spnego.channel_bindings.GssChannelBindings` for the context. When
+            combined with :attr:`spnego.NegotiateOptions.strict_channel_bindings` these bindings must be derived from
+            the real transport channel, like the `tls-server-end-point` channel binding of the negotiated TLS
+            connection, and not from data the initiator reports itself.
         context_req: The :class:`spnego.ContextReq` flags to use when setting up the context.
         protocol: The protocol to authenticate with, can be `ntlm`, `kerberos`, `negotiate`, or `credssp`.
-        options: The :class:`spnego.NegotiateOptions` that define pyspnego specific options to control the negotiation.
+        options: The :class:`spnego.NegotiateOptions` that define pyspnego specific options to control the
+            negotiation. Set `NegotiateOptions.strict_channel_bindings` to require the initiator to present a channel
+            binding hash that exactly matches `channel_bindings`; providers that cannot enforce this fail fast.
         credentials: A credential or list or credentials to use with the server auth context.
         kwargs: Optional arguments to pass through to the authentiction context.
 

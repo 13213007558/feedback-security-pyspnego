@@ -78,6 +78,17 @@ class NegotiateOptions(enum.IntFlag):
         To created a wrapped WinRM message the IOV extensions are required when using Kerberos auth. Setting this flag
         will skip Kerberos when `protocol='negotiate'` if the IOV headers aren't present and just fallback to NTLM.
 
+    strict_channel_bindings:
+        Requires an acceptor to enforce the channel bindings in the strictest way possible. When the acceptor is
+        configured with :class:`spnego.channel_bindings.GssChannelBindings` the initiator must present a channel
+        binding hash that exactly matches the one derived from the configured bindings. Missing bindings, a hash of
+        all zero bytes (which represents an unbound channel), and mismatched hashes all fail the authentication.
+        Without this flag the NTLM acceptor retains its historical behaviour of also accepting an all zero hash.
+        Providers that cannot enforce this requirement, like the native GSSAPI and SSPI providers, fail fast with a
+        :class:`spnego.exceptions.OperationNotAvailableError` rather than silently ignoring the option. The bindings
+        passed to the acceptor must come from the real TLS channel, like the `tls-server-end-point` channel binding
+        of the negotiated connection, and must never be populated from data the initiator reports itself.
+
     .. _gss-ntlmssp:
         https://github.com/gssapi/gss-ntlmssp
     """
@@ -94,6 +105,7 @@ class NegotiateOptions(enum.IntFlag):
     session_key = 0x00000020
     wrapping_iov = 0x00000040
     wrapping_winrm = 0x00000080
+    strict_channel_bindings = 0x00000100
 
 
 class FeatureMissingError(Exception):

@@ -14,8 +14,9 @@ import spnego
 import spnego._ntlm as ntlm
 import spnego.channel_bindings
 import spnego.iov
-from spnego._credential import CredentialCache
-from spnego._ntlm_raw.crypto import md4
+from spnego._credential import CredentialCache, Password
+from spnego._ntlm import _NTLMCredential
+from spnego._ntlm_raw.crypto import compute_response_v2, md4, ntowfv2, rc4k
 from spnego._ntlm_raw.messages import (
     Authenticate,
     AvId,
@@ -494,6 +495,224 @@ def test_ntlm_bad_bindings(client_opt, present, ntlm_cred):
 
     with pytest.raises(BadBindingsError, match=expected):
         s.step(auth)
+
+
+def _ntlm_handshake(ntlm_cred, client_cbt, server_cbt, *, strict=False, auth_mutator=None):
+    """Run a pure Python NTLM offline handshake and return the client/server contexts.
+
+    The optional auth_mutator receives the packed Authenticate message and can return a replacement before it is
+    handed to the acceptor. This is used to craft the all zero channel binding hash that no real client produces.
+    """
+    options = spnego.NegotiateOptions.use_ntlm
+    if strict:
+        options |= spnego.NegotiateOptions.strict_channel_bindings
+
+    client = spnego.client(
+        ntlm_cred[0],
+        ntlm_cred[1],
+        hostname=socket.gethostname(),
+        protocol="ntlm",
+        options=spnego.NegotiateOptions.use_ntlm,
+        channel_bindings=client_cbt,
+    )
+    server = spnego.server(protocol="ntlm", options=options, channel_bindings=server_cbt)
+
+    negotiate = client.step()
+    challenge = server.step(negotiate)
+    authenticate = client.step(challenge)
+    if auth_mutator:
+        authenticate = auth_mutator(ntlm_cred, Challenge.unpack(challenge))
+
+    server.step(authenticate)
+    return client, server
+
+
+def _authenticate_with_zero_bindings(ntlm_cred, challenge):
+    """Rebuild an NTLMv2 Authenticate message that carries an all zero channel binding hash.
+
+    The response is recomputed against the acceptor challenge so the NT proof and key exchange stay valid, only the
+    MsvChannelBindings AV pair value is replaced with 16 zero bytes. No MIC AV flag is set so the token has no MIC to
+    invalidate.
+    """
+    domain, username = ntlm_cred[0].split("\\", 1)
+    credential = _NTLMCredential(Password(username=ntlm_cred[0], password=ntlm_cred[1]))
+
+    target_info = challenge.target_info.copy()
+    target_info[AvId.channel_bindings] = b"\x00" * 16
+    target_info[AvId.target_name] = ""
+
+    client_challenge = os.urandom(8)
+    ntv2_hash = ntowfv2(username, credential.nt_hash, domain)
+    nt_challenge, lm_challenge, key_exchange_key = compute_response_v2(
+        ntv2_hash, challenge.server_challenge, client_challenge, target_info[AvId.timestamp], target_info
+    )
+
+    session_key = os.urandom(16)
+    encrypted_session_key = rc4k(key_exchange_key, session_key)
+
+    auth = Authenticate(
+        challenge.flags,
+        lm_challenge,
+        nt_challenge,
+        domain_name=domain,
+        username=username,
+        encrypted_session_key=encrypted_session_key,
+    )
+    return auth.pack()
+
+
+def test_ntlm_strict_channel_bindings_match(ntlm_cred):
+    cbt = spnego.channel_bindings.GssChannelBindings(application_data=b"tls-server-end-point:real-channel")
+
+    client, server = _ntlm_handshake(ntlm_cred, cbt, cbt, strict=True)
+
+    assert client.complete
+    assert server.complete
+    # Message protection is available on the fully established, bound context.
+    wrapped = server.wrap(b"protected message")
+    assert client.unwrap(wrapped.data).data == b"protected message"
+
+
+def test_ntlm_strict_channel_bindings_different_channel(ntlm_cred):
+    client_cbt = spnego.channel_bindings.GssChannelBindings(application_data=b"tls-server-end-point:channel-a")
+    server_cbt = spnego.channel_bindings.GssChannelBindings(application_data=b"tls-server-end-point:channel-b")
+
+    with pytest.raises(BadBindingsError, match="Acceptor bindings do not match initiator bindings"):
+        _ntlm_handshake(ntlm_cred, client_cbt, server_cbt, strict=True)
+
+
+def test_ntlm_strict_channel_bindings_missing(ntlm_cred):
+    server_cbt = spnego.channel_bindings.GssChannelBindings(application_data=b"tls-server-end-point:real-channel")
+
+    with pytest.raises(
+        BadBindingsError, match="Acceptor bindings specified but not present in initiator response"
+    ):
+        _ntlm_handshake(ntlm_cred, None, server_cbt, strict=True)
+
+
+def test_ntlm_strict_channel_bindings_rejects_zero_hash(ntlm_cred):
+    cbt = spnego.channel_bindings.GssChannelBindings(application_data=b"tls-server-end-point:real-channel")
+
+    with pytest.raises(BadBindingsError, match="all zero channel binding hash"):
+        _ntlm_handshake(ntlm_cred, cbt, cbt, strict=True, auth_mutator=_authenticate_with_zero_bindings)
+
+
+def test_ntlm_compat_channel_bindings_accepts_zero_hash(ntlm_cred):
+    # The default (non strict) behaviour stays backwards compatible and treats the all zero hash as an unbound
+    # channel rather than failing the authentication.
+    cbt = spnego.channel_bindings.GssChannelBindings(application_data=b"tls-server-end-point:real-channel")
+
+    client, server = _ntlm_handshake(ntlm_cred, cbt, cbt, strict=False, auth_mutator=_authenticate_with_zero_bindings)
+
+    assert server.complete
+    wrapped = server.wrap(b"compat message")
+    assert wrapped.data
+
+
+def test_ntlm_strict_channel_bindings_failure_has_no_message_protection(ntlm_cred):
+    server_cbt = spnego.channel_bindings.GssChannelBindings(application_data=b"tls-server-end-point:real-channel")
+    options = spnego.NegotiateOptions.use_ntlm | spnego.NegotiateOptions.strict_channel_bindings
+
+    client = spnego.client(
+        ntlm_cred[0],
+        ntlm_cred[1],
+        hostname=socket.gethostname(),
+        protocol="ntlm",
+        options=spnego.NegotiateOptions.use_ntlm,
+    )
+    server = spnego.server(protocol="ntlm", options=options, channel_bindings=server_cbt)
+
+    challenge = server.step(client.step())
+    with pytest.raises(BadBindingsError):
+        server.step(client.step(challenge))
+
+    assert not server.complete
+    with pytest.raises(SpnegoError):
+        server.wrap(b"never protected")
+    with pytest.raises(SpnegoError):
+        server.unwrap(b"never protected")
+    with pytest.raises(SpnegoError):
+        server.sign(b"never protected")
+
+
+def test_ntlm_strict_channel_bindings_requires_configured_bindings(ntlm_cred):
+    # The option must not be silently ignored: a strict acceptor without bindings fails fast rather than behaving
+    # like an unbound acceptor.
+    with pytest.raises(OperationNotAvailableError, match="no GssChannelBindings were provided"):
+        spnego.server(
+            protocol="ntlm",
+            options=spnego.NegotiateOptions.use_ntlm | spnego.NegotiateOptions.strict_channel_bindings,
+        )
+
+
+def test_ntlm_strict_channel_bindings_unsupported_provider(ntlm_cred, monkeypatch):
+    # A provider that cannot enforce strict bindings must fail fast instead of silently ignoring the option and
+    # completing the context.
+    class UnsupportedProxy(spnego.ContextProxy):
+        @property
+        def _context_attr_map(self):
+            return []
+
+        @property
+        def client_principal(self):
+            return None
+
+        @property
+        def complete(self):
+            return False
+
+        @property
+        def negotiated_protocol(self):
+            return None
+
+        @property
+        def session_key(self):
+            return b""
+
+        def new_context(self):
+            pass
+
+        def query_message_sizes(self):
+            pass
+
+        def step(self, in_token=None, *, channel_bindings=None):
+            pass
+
+        def wrap(self, data, encrypt=True, qop=None):
+            pass
+
+        def wrap_iov(self, iov, encrypt=True, qop=None):
+            pass
+
+        def wrap_winrm(self, data):
+            pass
+
+        def unwrap(self, data):
+            pass
+
+        def unwrap_iov(self, iov):
+            pass
+
+        def unwrap_winrm(self, header, data):
+            pass
+
+        def sign(self, data, qop=None):
+            pass
+
+        def verify(self, data, mic):
+            pass
+
+    with pytest.raises(OperationNotAvailableError, match="cannot enforce strict channel bindings"):
+        UnsupportedProxy(
+            credentials=[],
+            hostname="unspecified",
+            service="host",
+            channel_bindings=spnego.channel_bindings.GssChannelBindings(application_data=b"tls-server-end-point:x"),
+            context_req=spnego.ContextReq.default,
+            usage="accept",
+            protocol="ntlm",
+            options=spnego.NegotiateOptions.strict_channel_bindings,
+        )
 
 
 def test_ntlm_bad_mic(ntlm_cred):

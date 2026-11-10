@@ -2,6 +2,7 @@
 # Copyright: (c) 2020, Jordan Borean (@jborean93) <jborean93@gmail.com>
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
+import socket
 import typing
 
 import pytest
@@ -11,7 +12,7 @@ import spnego._gss
 from spnego._context import GSSMech
 from spnego._negotiate import NegotiateProxy
 from spnego._spnego import NegState, NegTokenInit, NegTokenResp
-from spnego.exceptions import BadMechanismError, InvalidTokenError
+from spnego.exceptions import BadBindingsError, BadMechanismError, InvalidTokenError
 
 
 def test_token_rejected(ntlm_cred):
@@ -301,3 +302,54 @@ def test_initiator_accepts_kerberos_alias_supported_mech(supported_mech):
     assert c.step(resp) is None
     assert c.complete
     assert c.negotiated_protocol == "kerberos"
+
+
+def _run_spnego_handshake(ntlm_cred, client_cbt, server_cbt, *, strict=False):
+    options = spnego.NegotiateOptions.use_negotiate
+    if strict:
+        options |= spnego.NegotiateOptions.strict_channel_bindings
+
+    client = spnego.client(
+        ntlm_cred[0],
+        ntlm_cred[1],
+        hostname=socket.gethostname(),
+        protocol="negotiate",
+        options=spnego.NegotiateOptions.use_negotiate,
+        channel_bindings=client_cbt,
+    )
+    server = spnego.server(protocol="negotiate", options=options, channel_bindings=server_cbt)
+
+    token = client.step()
+    while not (client.complete and server.complete):
+        token = server.step(token)
+        if not client.complete:
+            token = client.step(token)
+
+    return client, server
+
+
+def test_negotiate_strict_channel_bindings_match(ntlm_cred):
+    cbt = spnego.channel_bindings.GssChannelBindings(application_data=b"tls-server-end-point:real-channel")
+    client, server = _run_spnego_handshake(ntlm_cred, cbt, cbt, strict=True)
+
+    assert client.complete
+    assert server.complete
+    assert server.negotiated_protocol == "ntlm"
+
+    wrapped = server.wrap(b"protected")
+    assert client.unwrap(wrapped.data).data == b"protected"
+
+
+def test_negotiate_strict_channel_bindings_mismatch(ntlm_cred):
+    client_cbt = spnego.channel_bindings.GssChannelBindings(application_data=b"tls-server-end-point:channel-a")
+    server_cbt = spnego.channel_bindings.GssChannelBindings(application_data=b"tls-server-end-point:channel-b")
+
+    with pytest.raises(BadBindingsError, match="do not match initiator bindings"):
+        _run_spnego_handshake(ntlm_cred, client_cbt, server_cbt, strict=True)
+
+
+def test_negotiate_strict_channel_bindings_missing(ntlm_cred):
+    server_cbt = spnego.channel_bindings.GssChannelBindings(application_data=b"tls-server-end-point:real-channel")
+
+    with pytest.raises(BadBindingsError, match="not present in initiator response"):
+        _run_spnego_handshake(ntlm_cred, None, server_cbt, strict=True)

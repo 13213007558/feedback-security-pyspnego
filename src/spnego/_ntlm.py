@@ -240,6 +240,8 @@ class NTLMProxy(ContextProxy):
     This is a context that can be used on Linux to generate NTLM without any system dependencies.
     """
 
+    _supports_strict_channel_bindings = True
+
     def __init__(
         self,
         username: typing.Optional[typing.Union[str, Credential, typing.List[Credential]]] = None,
@@ -584,7 +586,18 @@ class NTLMProxy(ContextProxy):
 
                 expected_bindings = target_info[AvId.channel_bindings]
                 actual_bindings = md5(channel_bindings.pack())
-                if expected_bindings not in [actual_bindings, b"\x00" * 16]:
+
+                # An all zero hash is the NTLM representation of an unbound channel. The default behaviour stays
+                # backwards compatible and accepts it, strict mode rejects it so an initiator cannot authenticate
+                # without proving possession of the real channel bindings.
+                if expected_bindings == b"\x00" * 16:
+                    if self.options & NegotiateOptions.strict_channel_bindings:
+                        raise BadBindingsError(
+                            context_msg="Initiator presented an all zero channel binding hash which is not "
+                            "permitted when strict channel bindings are required"
+                        )
+
+                elif expected_bindings != actual_bindings:
                     raise BadBindingsError(context_msg="Acceptor bindings do not match initiator bindings")
 
             if target_info.get(AvId.flags, 0) & AvFlags.mic:

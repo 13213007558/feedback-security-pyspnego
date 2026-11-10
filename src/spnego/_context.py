@@ -10,7 +10,12 @@ import warnings
 from spnego._credential import Credential
 from spnego._text import to_text
 from spnego.channel_bindings import GssChannelBindings
-from spnego.exceptions import FeatureMissingError, NegotiateOptions, SpnegoError
+from spnego.exceptions import (
+    FeatureMissingError,
+    NegotiateOptions,
+    OperationNotAvailableError,
+    SpnegoError,
+)
 from spnego.iov import BufferType, IOVBuffer, IOVResBuffer
 
 F = typing.TypeVar("F", bound=typing.Callable[..., typing.Any])
@@ -259,6 +264,11 @@ class ContextProxy(metaclass=abc.ABCMeta):
         context_req (ContextReq): The context requirements flags as an int value specific to the context provider.
     """
 
+    #: Whether the provider is able to enforce :attr:`NegotiateOptions.strict_channel_bindings` on an acceptor.
+    #: Providers that cannot guarantee the requirement must leave this as False so the option fails fast instead of
+    #: being silently ignored.
+    _supports_strict_channel_bindings: bool = False
+
     def __init__(
         self,
         credentials: typing.List[Credential],
@@ -289,6 +299,26 @@ class ContextProxy(metaclass=abc.ABCMeta):
 
         self.channel_bindings = channel_bindings
         self.options = NegotiateOptions(options)
+
+        if (
+            self.usage == "accept"
+            and self.options & NegotiateOptions.strict_channel_bindings
+            and not self._supports_strict_channel_bindings
+        ):
+            raise OperationNotAvailableError(
+                context_msg="The %s provider cannot enforce strict channel bindings; use the builtin NTLM provider "
+                "or one that explicitly supports this requirement" % type(self).__name__
+            )
+
+        if (
+            self.usage == "accept"
+            and self.options & NegotiateOptions.strict_channel_bindings
+            and not channel_bindings
+        ):
+            raise OperationNotAvailableError(
+                context_msg="Strict channel bindings were required but no GssChannelBindings were provided; pass the "
+                "bindings derived from the real transport channel to the acceptor or supply them with step()"
+            )
 
         self.context_req = context_req  # Generic context requirements.
         self._context_req = 0  # Provider specific context requirements.

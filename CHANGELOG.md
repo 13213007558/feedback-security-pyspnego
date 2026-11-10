@@ -2,6 +2,12 @@
 
 ## 0.13.0 - TBD
 
+* Add `NegotiateOptions.strict_channel_bindings` for acceptors that must reject unbound NTLM authentication
+  * When set together with `channel_bindings` on an `spnego.server()` context the pure Python NTLM and SPNEGO providers require the initiator's channel binding hash to exactly match the configured `GssChannelBindings`; missing bindings, an all zero hash, and mismatched hashes fail with `BadBindingsError`
+  * Without the flag the historical NTLM behaviour is retained and an all zero hash is still accepted
+  * Providers that cannot enforce the requirement, like the native GSSAPI, SSPI, and CredSSP providers, raise `OperationNotAvailableError` when the acceptor context is created instead of silently ignoring the option
+  * The acceptor bindings must be derived from the real TLS channel (for example the `tls-server-end-point` channel binding of the negotiated connection) and must never be populated from data reported by the initiator
+
 ## 0.12.4 - 2026-10-06
 
 * Fix SSPI acceptor with explicit `Password` or `KerberosKeytab` credentials failing with `SEC_E_LOGON_DENIED` when the username is in the UPN form `user@REALM`
